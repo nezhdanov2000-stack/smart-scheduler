@@ -1,0 +1,1777 @@
+{
+  "id": "sched4922e255390",
+  "name": "Smart Scheduling - Three-Stage LLM Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API. In queue mode the execution is pushed to Redis/BullMQ and picked up by a worker.\n\n**Edit `CONFIG` in _Prepare Input_** (timezone, calendar, retries).",
+        "width": 420,
+        "height": 380
+      },
+      "id": "65d3ec0a-9052-5ac4-9a4f-bae8466ea83a",
+      "name": "Note: Ingestion",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Stage 1 · Context filtering & temporal normalisation\nBinary scheduling-intent detection; \"after lunch\" → 13:00. Non-scheduling messages exit here.",
+        "width": 640,
+        "height": 380,
+        "color": 4
+      },
+      "id": "a483f22b-7c39-59d7-8ab9-8d4918edf3a8",
+      "name": "Note: Stage 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        400,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Stage 2 · Intent classification & entity extraction\ncreate / modify / cancel + title, datetime, participants, location. 60-minute default duration.",
+        "width": 640,
+        "height": 380,
+        "color": 5
+      },
+      "id": "3ea58a06-8e25-5f3f-8f63-8f69a5801562",
+      "name": "Note: Stage 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Stage 3 · API command synthesis & validation\nJSON for the Calendar Events API v3, schema-validated; validation errors are fed back to the model for an automatic prompt-adjusted retry.",
+        "width": 900,
+        "height": 560,
+        "color": 6
+      },
+      "id": "9a43e90e-c7ae-542b-93f2-54c3044310b3",
+      "name": "Note: Stage 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Google Calendar API\nBefore POST (create) and PATCH (modify) the requested slot is checked against existing events: an overlap stops the operation and the user gets a warning with the next free slot. Each call retries 4 × 5 s on transient failures.",
+        "width": 1900,
+        "height": 780,
+        "color": 3
+      },
+      "id": "d3e3e882-a0dd-5c6f-966d-90f1d1d4996b",
+      "name": "Note: Calendar",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2700,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Confirmation & audit trail\nTelegram reply + one row in `scheduling_audit` (PostgreSQL).\n\n**Ask before adding**: when `confirmBefore` applies, the event is parked in `pending_actions` and the owner gets a card with ✅ / ❌. The button press comes back through the trigger as a callback_query (*Callback?* branch, bottom-left), the saved context is restored and the calendar nodes run.",
+        "width": 900,
+        "height": 560
+      },
+      "id": "10aa6f51-1c59-53d9-8e65-98b3953cb29f",
+      "name": "Note: Output",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4640,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "business_message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "72fda541-15b3-572d-841b-d486caec021d",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "webhookId": "71e47a74-bbe0-558e-9b5b-8ec249d7b86f"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Prepare Input ───────────────────────────────────────────────────────────\n// Normalises the Telegram update, holds the workflow configuration and builds\n// the Stage 1 request. Edit CONFIG to suit your deployment (no secrets here –\n// API keys live in the n8n credential vault).\nconst CONFIG = {\n  model: 'gpt-4o-mini',            // inference engine for all three stages\n  timezone: 'Asia/Bangkok',        // IANA timezone used for \"now\" and for calendar events\n  calendarId: 'primary',           // Google Calendar to write to\n  placeholderEmailDomain: 'example.com', // attendees without a known e-mail\n  maxStage3Retries: 2,             // prompt-adjusted retries after schema-validation failure\n  sendConfirmation: true,          // reply in the Telegram chat after a calendar operation\n  logMessageText: false,           // data minimisation: keep raw text out of the audit table\n  allowedChatIds: [],              // e.g. [-1001234567890]; empty = accept every chat\n  // Telegram Business \"Chatbots\": messages from the owner's private chats arrive as\n  // business_message. Confirmations for those are sent to the OWNER's private chat with the\n  // bot (never to the other person). Set to your own chat id; empty = no confirmations for them.\n  ownerChatId: 845660052,\n  // Ask before writing to the calendar: 'business' = only for messages from your private chats\n  // (Telegram Business), 'all' = always ask, 'none' = never ask. The question goes to ownerChatId.\n  confirmBefore: 'business',\n  conflictPolicy: 'reject',        // 'reject' = never double-book (warn + suggest next free slot); 'allow' = no check\n  workdayEnd: 21,                  // hour (24h) after which no alternative slot is suggested\n};\n\nconst STAGE1_PROMPT = \"You are a scheduling intent filter. Given a Telegram message and the current date/time, perform two tasks:\\n1. Determine whether the message contains actionable scheduling intent (yes/no).\\n2. If yes, normalise all temporal expressions to ISO 8601 format (YYYY-MM-DDTHH:MM:SS) relative to the current date/time.\\nExamples: \\\"tomorrow at 4pm\\\" → 2025-06-16T16:00:00 (when today is 2025-06-15); \\\"after lunch\\\" → current-dateT13:00:00; \\\"next Friday\\\" → next Friday's dateT09:00:00 (default).\\nOutput JSON: {\\\"is_scheduling\\\": bool, \\\"normalised_message\\\": string, \\\"temporal_expressions\\\": [{\\\"original\\\": string, \\\"normalised\\\": string}]}.\\nIn \\\"normalised_message\\\", rewrite the message with every temporal expression replaced by its ISO 8601 value.\\nIf the message has no scheduling intent, return {\\\"is_scheduling\\\": false} and stop.\\nDo not include any text outside the JSON object.\";\n\nconst update = $input.first().json;\n\n// ✅ / ❌ button pressed on a confirmation card\nif (update.callback_query) {\n  const q = update.callback_query;\n  const m = /^(ok|no):(\\d+)$/.exec(q.data || '');\n  if (!m) return [];\n  return [{ json: { kind: 'callback', config: CONFIG, callback: {\n    id: q.id, action: m[1], pending_id: Number(m[2]),\n    chat_id: q.message?.chat?.id, message_id: q.message?.message_id, message_text: q.message?.text || '',\n    from: q.from?.id } } }];\n}\n\nconst msg = update.message || update.business_message;\nif (!msg || typeof msg.text !== 'string' || !msg.text.trim()) return [];   // stickers, photos, joins, edits…\nif (msg.text.trim().startsWith('/')) return [];                             // bot commands\nconst business = !!msg.business_connection_id;\nif (!business && CONFIG.allowedChatIds.length && !CONFIG.allowedChatIds.includes(msg.chat.id)) return [];\nif (business && msg.from?.is_bot) return [];\n\nconst now = $now.setZone(CONFIG.timezone);\nconst nowIso = now.toFormat(\"yyyy-MM-dd'T'HH:mm:ss\");\nconst sender = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || msg.from?.username || 'unknown';\n\nreturn [{\n  json: {\n    kind: 'message',\n    config: CONFIG,\n    meta: {\n      received_at_ms: Date.now(),\n      chat_id: msg.chat.id,\n      message_id: msg.message_id,\n      business,\n      business_connection_id: msg.business_connection_id || null,\n      // where confirmations go: the same chat for normal messages, the owner's chat for business ones\n      reply_chat_id: business ? (CONFIG.ownerChatId || null) : msg.chat.id,\n      reply_to: business ? null : msg.message_id,\n      counterpart: business ? ([msg.chat.first_name, msg.chat.last_name].filter(Boolean).join(' ') || msg.chat.title || String(msg.chat.id)) : null,\n      sender,\n      now: nowIso,\n      weekday: now.toFormat('cccc'),\n    },\n    text: msg.text.trim(),\n    request: {\n      model: CONFIG.model,\n      temperature: 0,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: STAGE1_PROMPT },\n        { role: 'user', content: `Current date/time: ${nowIso} (${now.toFormat('cccc')}), timezone ${CONFIG.timezone}\\nMessage: ${msg.text.trim()}` },\n      ],\n    },\n  },\n}];\n"
+      },
+      "id": "8a43f3ae-0dcb-53bb-a46f-ae92e8a17eba",
+      "name": "Prepare Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2dcea7ed-d388-5231-b73a-6fc2560b3cc7",
+              "leftValue": "={{ $json.kind === 'callback' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e06ef0d5-9a89-51cd-ab97-b0bdcce5a164",
+      "name": "Callback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c91940e0-2bec-553c-ada8-67cfa0a87c2a",
+              "leftValue": "={{ !!$json.meta.reply_chat_id && ($json.config.confirmBefore === 'all' || ($json.config.confirmBefore === 'business' && $json.meta.business)) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "911a8753-9e14-572b-8574-979a4e0d2fba",
+      "name": "Confirm Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4200,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Prepare Confirmation ────────────────────────────────────────────────────\n// Builds the \"Schedule this?\" card that is sent to the owner with ✅ / ❌ buttons.\nconst ctx = $input.first().json;\nconst fmt = iso => iso ? DateTime.fromISO(String(iso).slice(0, 19)).toFormat(\"ccc d LLL, HH:mm\") : '?';\nconst ent = ctx.stage2.entities;\nconst body = ctx.stage3.command.body || {};\nconst quote = ctx.text.length > 160 ? ctx.text.slice(0, 157) + '…' : ctx.text;\nconst who = ctx.meta.business ? `${ctx.meta.sender} in chat with ${ctx.meta.counterpart}` : ctx.meta.sender;\nlet card;\nif (ctx.stage2.intent === 'modify') {\n  card = `✏️ Move \"${ctx.lookup.event_summary}\"` + (body.start?.dateTime ? ` to ${fmt(body.start.dateTime)}` : '') + '?';\n} else {\n  card = `📅 Add to calendar?\\n\\n${body.summary || ent.event_title}\\n🕒 ${fmt(body.start?.dateTime)} – ${fmt(body.end?.dateTime).split(', ')[1] || ''}` +\n         (body.location ? `\\n📍 ${body.location}` : '') +\n         (ent.participants?.length ? `\\n👥 ${ent.participants.join(', ')}` : '');\n}\nreturn [{ json: { ...ctx, ask_text: `💬 ${who}: \"${quote}\"\\n\\n${card}` } }];\n"
+      },
+      "id": "57b91dcc-ed27-5dd7-a334-30dc44a660aa",
+      "name": "Prepare Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4400,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pending_actions (chat_id, ctx) VALUES ($1, $2::jsonb) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ String($json.meta.reply_chat_id), JSON.stringify($json) ] }}"
+        }
+      },
+      "id": "e0ac5a11-a7df-59f3-9b66-849f47a31559",
+      "name": "Save Pending",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4600,
+        -220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "schedPostgres0001",
+          "name": "Audit Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Prepare Confirmation').first().json.meta.reply_chat_id }}",
+        "text": "={{ $('Prepare Confirmation').first().json.ask_text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Add",
+                    "additionalFields": {
+                      "callback_data": "=ok:{{ $json.id }}"
+                    }
+                  },
+                  {
+                    "text": "❌ Skip",
+                    "additionalFields": {
+                      "callback_data": "=no:{{ $json.id }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "4b9699c2-4919-510f-98f9-03818836c489",
+      "name": "Ask Owner",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4800,
+        -220
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE pending_actions SET status = $2, resolved_at = now() WHERE id = $1 AND status = 'pending' RETURNING id, ctx;",
+        "options": {
+          "queryReplacement": "={{ [ $json.callback.pending_id, $json.callback.action === 'ok' ? 'approved' : 'skipped' ] }}"
+        }
+      },
+      "id": "ca400c58-7893-5538-8a4c-22b4db915663",
+      "name": "Load Pending",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        600,
+        800
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "schedPostgres0001",
+          "name": "Audit Postgres"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Restore Pending ─────────────────────────────────────────────────────────\n// The owner tapped ✅ or ❌. Reloads the saved pipeline context so the calendar\n// nodes can run exactly as they would have without the confirmation step.\nconst cb = $('Prepare Input').first().json.callback;\nconst row = $input.first().json || {};\nconst expired = !row.ctx;\nconst ctx = expired ? {} : (typeof row.ctx === 'string' ? JSON.parse(row.ctx) : row.ctx);\nconst approved = !expired && cb.action === 'ok';\nconst statusLine = expired ? '⚠️ Already handled.' : approved ? '⏳ Adding…' : '❌ Skipped.';\nreturn [{\n  json: {\n    ...ctx,\n    config: ctx.config || $('Prepare Input').first().json.config,\n    meta: ctx.meta || { reply_chat_id: cb.chat_id, chat_id: cb.chat_id, message_id: cb.message_id, received_at_ms: Date.now(), business: false },\n    kind: 'callback', callback: cb, expired, approved,\n    pending_id: cb.pending_id,\n    edit_text: `${cb.message_text}\\n\\n${statusLine}`,\n    answer_text: expired ? 'Already handled' : approved ? 'Adding to calendar…' : 'Skipped',\n  },\n}];\n"
+      },
+      "id": "5e52244d-42ae-5740-b9b2-882ceb470025",
+      "name": "Restore Pending",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "operation": "answerQuery",
+        "queryId": "={{ $json.callback.id }}",
+        "additionalFields": {
+          "text": "={{ $json.answer_text }}"
+        }
+      },
+      "id": "30ccbb13-5ed8-525f-850d-890fa4bede78",
+      "name": "Answer Callback",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        800
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "editMessageText",
+        "messageType": "message",
+        "chatId": "={{ $('Restore Pending').first().json.callback.chat_id }}",
+        "messageId": "={{ $('Restore Pending').first().json.callback.message_id }}",
+        "text": "={{ $('Restore Pending').first().json.edit_text }}",
+        "additionalFields": {}
+      },
+      "id": "27dc6594-8b99-5a84-8a36-9db87098a20f",
+      "name": "Edit Card",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        800
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Resume ──────────────────────────────────────────────────────────────────\n// Passes the restored context on after the Telegram housekeeping nodes.\nreturn [{ json: $('Restore Pending').first().json }];\n"
+      },
+      "id": "8148da49-4878-51c6-90ee-e53f524a2917",
+      "name": "Resume",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "89da150b-3fa7-58b6-973c-580affcf0212",
+              "leftValue": "={{ $json.approved === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "51991be0-5c4e-5826-8809-6eb9a69d1028",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1600,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "caa34b05-4f7d-5254-8ebe-1f8d75170e83",
+      "name": "Stage 1 LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "schedOpenAi000001",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Parse Stage 1 ───────────────────────────────────────────────────────────\n// Reads the Stage 1 verdict. Scheduling messages get a Stage 2 request attached;\n// everything else exits the pipeline here (no further API calls).\nconst STAGE2_PROMPT = \"You are a scheduling entity extractor. Given the normalised message from Stage 1, perform:\\n1. Classify the scheduling intent as one of: \\\"create\\\", \\\"modify\\\", \\\"cancel\\\".\\n2. Extract these fields: event_title (string), start_datetime (ISO 8601), end_datetime (ISO 8601 or null), location (string or null), participants (list of strings).\\nIf end_datetime is not specified, infer a 60-minute default duration.\\nFor \\\"modify\\\", start_datetime/end_datetime are the NEW times of the event. For \\\"cancel\\\", they are the times of the event being cancelled (null if unknown).\\nOutput JSON: {\\\"intent\\\": string, \\\"entities\\\": {\\\"event_title\\\": string, \\\"start_datetime\\\": string, \\\"end_datetime\\\": string, \\\"location\\\": string|null, \\\"participants\\\": [string]}}\\nDo not include any text outside the JSON object.\";\n\nconst ctx = $('Prepare Input').first().json;\nconst resp = $input.first().json;\n\nlet stage1;\ntry {\n  stage1 = JSON.parse(resp.choices[0].message.content);\n} catch (e) {\n  stage1 = { is_scheduling: false, error: 'Stage 1 returned unparseable output' };\n}\nstage1.is_scheduling = stage1.is_scheduling === true;\nif (stage1.is_scheduling && !stage1.normalised_message) stage1.normalised_message = ctx.text;\n\nconst out = { ...ctx, stage1, request: null };\nif (stage1.is_scheduling) {\n  out.request = {\n    model: ctx.config.model,\n    temperature: 0,\n    response_format: { type: 'json_object' },\n    messages: [\n      { role: 'system', content: STAGE2_PROMPT },\n      { role: 'user', content:\n          `Current date/time: ${ctx.meta.now} (${ctx.meta.weekday})\\n` +\n          `Sender: ${ctx.meta.sender}\\n` +\n          `Normalised message: ${stage1.normalised_message}\\n` +\n          `Temporal expressions: ${JSON.stringify(stage1.temporal_expressions || [])}` },\n    ],\n  };\n}\nreturn [{ json: out }];\n"
+      },
+      "id": "64bd30a4-9ad9-57fd-8520-c4823bde1398",
+      "name": "Parse Stage 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ba5ec23e-d0c9-5c62-b0f4-cc7edb5c2d9c",
+              "leftValue": "={{ $json.stage1.is_scheduling }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3284d3d-f5db-57c4-a46d-69fb70b39c02",
+      "name": "Scheduling?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "54fcb815-0a00-56e8-95d1-89cb4e62305c",
+      "name": "Stage 2 LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "schedOpenAi000001",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Parse Stage 2 ───────────────────────────────────────────────────────────\n// Checks that the intent is known and the required entities are present.\nconst ctx = $('Parse Stage 1').first().json;\nconst resp = $input.first().json;\nconst ISO = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2})?/;\n\nlet stage2, errors = [];\ntry {\n  stage2 = JSON.parse(resp.choices[0].message.content);\n} catch (e) {\n  stage2 = {}; errors.push('Stage 2 returned unparseable output');\n}\nconst ent = stage2.entities || {};\nif (!['create', 'modify', 'cancel'].includes(stage2.intent)) errors.push('unknown intent');\nif (!ent.event_title || typeof ent.event_title !== 'string') errors.push('missing event_title');\nif (stage2.intent !== 'cancel' && !ISO.test(ent.start_datetime || '')) errors.push('missing or malformed start_datetime');\n\n// 60-minute default duration (belt and braces – the prompt already asks for it)\nif (ISO.test(ent.start_datetime || '') && !ISO.test(ent.end_datetime || '')) {\n  const end = DateTime.fromISO(ent.start_datetime.slice(0, 19)).plus({ minutes: 60 });\n  ent.end_datetime = end.toFormat(\"yyyy-MM-dd'T'HH:mm:ss\");\n}\nif (!Array.isArray(ent.participants)) ent.participants = [];\nstage2.entities = ent;\nstage2.ok = errors.length === 0;\nstage2.errors = errors;\n\nreturn [{ json: { ...ctx, stage2, request: null } }];\n"
+      },
+      "id": "441e620f-5711-50dc-86c1-05d786061a94",
+      "name": "Parse Stage 2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "215e3fbd-2f6b-503f-b53c-47d7b1a7d2b7",
+              "leftValue": "={{ $json.stage2.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "22b1dadf-2c80-59b9-a56f-399a06f0c5df",
+      "name": "Entities OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1580,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Build Stage 3 Request ───────────────────────────────────────────────────\n// First pass comes from Parse Stage 2; later passes come from the retry branch\n// and carry the validator's error list, which is fed back to the model\n// (\"automatic prompt-adjusted retry\").\nconst STAGE3_PROMPT = \"You are a Google Calendar API command generator. Given the intent and entities from Stage 2, produce a JSON request body conforming to the Google Calendar Events API v3 schema.\\nRules:\\n(1) Use the \\\"summary\\\" field for the event title.\\n(2) Use \\\"dateTime\\\" with timezone for start/end: {\\\"dateTime\\\": \\\"YYYY-MM-DDTHH:MM:SS\\\", \\\"timeZone\\\": \\\"<IANA timezone>\\\"}.\\n(3) Map participants to the \\\"attendees\\\" array with \\\"email\\\" field (use placeholder if email unknown) and put the person's name in \\\"displayName\\\".\\n(4) Include \\\"location\\\" only if provided.\\n(5) For \\\"cancel\\\" intent, output a DELETE request specification.\\n(6) For \\\"modify\\\" intent, output a PATCH request body with only changed fields.\\nOutput envelope (always use exactly this shape):\\n{\\\"method\\\": \\\"POST\\\" | \\\"PATCH\\\" | \\\"DELETE\\\", \\\"body\\\": <Calendar API request body, or null for DELETE>, \\\"target\\\": {\\\"summary\\\": string, \\\"start_datetime\\\": string|null} | null}\\n\\\"target\\\" identifies the existing event for PATCH/DELETE and is null for POST.\\nOutput must be valid JSON parseable by the Calendar API. Do not include any text outside the JSON object.\";\n\nconst ctx = $input.first().json;\nconst attempt = (ctx.stage3?.attempt || 0) + 1;\nconst previousErrors = ctx.stage3?.errors || [];\n\nlet user =\n  `Timezone: ${ctx.config.timezone}\\n` +\n  `Placeholder e-mail format for unknown attendees: firstname.lastname@${ctx.config.placeholderEmailDomain}\\n` +\n  `Stage 2 output: ${JSON.stringify({ intent: ctx.stage2.intent, entities: ctx.stage2.entities })}`;\nif (previousErrors.length) {\n  user += `\\n\\nYour previous output was rejected by schema validation:\\n- ${previousErrors.join('\\n- ')}\\n` +\n          `Previous output: ${ctx.stage3.raw}\\nFix these problems and output the corrected JSON object only.`;\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    stage3: { attempt, errors: previousErrors },\n    request: {\n      model: ctx.config.model,\n      temperature: 0,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: STAGE3_PROMPT },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n}];\n"
+      },
+      "id": "c3003d3d-4061-5c4b-ae65-4c550412d0aa",
+      "name": "Build Stage 3 Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "b3b10c1e-6010-5f9f-85c3-1cab1db90323",
+      "name": "Stage 3 LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "schedOpenAi000001",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Validate Command ────────────────────────────────────────────────────────\n// Schema validation of the Stage 3 output against the Google Calendar Events\n// API v3 subset defined in schema/calendar_command.schema.json (kept in sync by\n// hand because the n8n Code node cannot load external libraries by default).\nconst ctx = $('Build Stage 3 Request').first().json;\nconst resp = $input.first().json;\n\nconst DT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})?$/;\nconst TZ = /^[A-Za-z_]+(\\/[A-Za-z0-9_+\\-]+)*$/;\nconst EMAIL = /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/;\nconst EVENT_KEYS = ['summary', 'description', 'location', 'start', 'end', 'attendees', 'reminders'];\nconst isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);\n\nfunction checkDateTime(v, path, errors) {\n  if (!isObj(v)) return errors.push(`${path} must be an object {dateTime, timeZone}`);\n  for (const k of Object.keys(v)) if (!['dateTime', 'timeZone'].includes(k)) errors.push(`${path}.${k} is not allowed`);\n  if (typeof v.dateTime !== 'string' || !DT.test(v.dateTime) || isNaN(Date.parse(v.dateTime.slice(0, 19))))\n    errors.push(`${path}.dateTime must be ISO 8601 (YYYY-MM-DDTHH:MM:SS)`);\n  if (typeof v.timeZone !== 'string' || !TZ.test(v.timeZone)) errors.push(`${path}.timeZone must be an IANA timezone`);\n}\n\nfunction checkEvent(body, requireCore, errors) {\n  if (!isObj(body)) return errors.push('body must be an object');\n  for (const k of Object.keys(body)) if (!EVENT_KEYS.includes(k)) errors.push(`body.${k} is not a supported Calendar API field`);\n  if (requireCore) for (const k of ['summary', 'start', 'end']) if (!(k in body)) errors.push(`body.${k} is required`);\n  if (!requireCore && Object.keys(body).length === 0) errors.push('PATCH body must contain at least one field');\n  if ('summary' in body && (typeof body.summary !== 'string' || !body.summary.trim())) errors.push('body.summary must be a non-empty string');\n  if ('description' in body && typeof body.description !== 'string') errors.push('body.description must be a string');\n  if ('location' in body && (typeof body.location !== 'string' || !body.location.trim())) errors.push('body.location must be a non-empty string (omit it if unknown)');\n  if ('start' in body) checkDateTime(body.start, 'body.start', errors);\n  if ('end' in body) checkDateTime(body.end, 'body.end', errors);\n  if (body.start?.dateTime && body.end?.dateTime && !errors.length &&\n      Date.parse(body.end.dateTime.slice(0, 19)) <= Date.parse(body.start.dateTime.slice(0, 19)))\n    errors.push('body.end must be after body.start');\n  if ('attendees' in body) {\n    if (!Array.isArray(body.attendees)) errors.push('body.attendees must be an array');\n    else body.attendees.forEach((a, i) => {\n      if (!isObj(a) || typeof a.email !== 'string' || !EMAIL.test(a.email)) errors.push(`body.attendees[${i}].email must be a valid e-mail`);\n      else for (const k of Object.keys(a)) if (!['email', 'displayName', 'optional'].includes(k)) errors.push(`body.attendees[${i}].${k} is not allowed`);\n    });\n  }\n}\n\nfunction validateCommand(cmd, intent) {\n  const errors = [];\n  if (!isObj(cmd)) return ['output must be a JSON object'];\n  for (const k of Object.keys(cmd)) if (!['method', 'body', 'target'].includes(k)) errors.push(`top-level field \"${k}\" is not allowed`);\n  const expected = { create: 'POST', modify: 'PATCH', cancel: 'DELETE' }[intent];\n  if (!['POST', 'PATCH', 'DELETE'].includes(cmd.method)) errors.push('method must be POST, PATCH or DELETE');\n  else if (expected && cmd.method !== expected) errors.push(`method must be ${expected} for intent \"${intent}\"`);\n  if (cmd.method === 'POST') checkEvent(cmd.body, true, errors);\n  if (cmd.method === 'PATCH') checkEvent(cmd.body, false, errors);\n  if (cmd.method === 'DELETE' && cmd.body != null) errors.push('body must be null for DELETE');\n  if (cmd.target != null) {\n    if (!isObj(cmd.target)) errors.push('target must be an object or null');\n    else if ('summary' in cmd.target && typeof cmd.target.summary !== 'string') errors.push('target.summary must be a string');\n  }\n  return errors;\n}\n\nlet raw = '', command = null, errors = [];\ntry {\n  raw = resp.choices[0].message.content;\n  command = JSON.parse(raw);\n  // tolerate a bare Events body for \"create\" by wrapping it in the envelope\n  if (isObj(command) && !('method' in command) && ('summary' in command || 'start' in command))\n    command = { method: 'POST', body: command, target: null };\n  errors = validateCommand(command, ctx.stage2.intent);\n} catch (e) {\n  errors = ['output is not parseable JSON'];\n}\n\n// PATCH/DELETE need something to look the event up by\nif (!errors.length && command.method !== 'POST') {\n  command.target = {\n    summary: command.target?.summary || ctx.stage2.entities.event_title,\n    start_datetime: command.target?.start_datetime ?? (ctx.stage2.intent === 'cancel' ? ctx.stage2.entities.start_datetime : null) ?? null,\n  };\n}\n\nconst valid = errors.length === 0;\nreturn [{\n  json: {\n    ...ctx,\n    request: null,\n    stage3: {\n      attempt: ctx.stage3.attempt,\n      valid,\n      errors,\n      raw,\n      command: valid ? command : null,\n      can_retry: !valid && ctx.stage3.attempt <= ctx.config.maxStage3Retries,\n    },\n  },\n}];\n"
+      },
+      "id": "877ce48a-e89b-5656-a594-f683dffcbac9",
+      "name": "Validate Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8ef57a53-ff6e-55cc-9daa-dc0a976e3b9b",
+              "leftValue": "={{ $json.stage3.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ee553d56-47f9-5ec8-9ea5-bf56e6091fce",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "80955142-45d7-5603-92b1-ded8514aa586",
+              "leftValue": "={{ $json.stage3.can_retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a8fa06f-f5ab-50f3-a32c-7d56e2318d26",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2480,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "42f2d0bb-356b-59a1-81a3-bfc2640294d2",
+              "leftValue": "={{ $json.stage3.command.method === 'POST' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27b501ed-310d-5a28-93ea-fc3eeb122f8d",
+      "name": "Create?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ DateTime.fromISO($json.stage3.command.body.start ? $json.stage3.command.body.start.dateTime : $now.toISO(), { zone: $json.config.timezone }).toUTC().toISO() }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ DateTime.fromISO($json.stage3.command.body.start ? $json.stage3.command.body.start.dateTime : $now.toISO(), { zone: $json.config.timezone }).endOf('day').toUTC().toISO() }}"
+            },
+            {
+              "name": "timeZone",
+              "value": "={{ $json.config.timezone }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "id": "6b48e991-31fd-5280-aa2b-68344cdb3732",
+      "name": "Find Conflicts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        100
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Detect Conflict ─────────────────────────────────────────────────────────\n// Runs before every POST (create) and PATCH (modify). Looks at the events that\n// \"Find Conflicts\" fetched for the rest of that day and decides whether the\n// requested slot overlaps an existing event. If it does, the calendar is left\n// untouched and the user gets a warning plus the next free slot of the same\n// length (same day, up to CONFIG.workdayEnd).\nconst ran = name => { try { return $(name).isExecuted; } catch (e) { return false; } };\nconst ctx = ran('Pick Event') ? $('Pick Event').first().json : $('Validate Command').first().json;\nconst resp = $input.first().json;\nconst tz = ctx.config.timezone;\nconst body = ctx.stage3.command.body || {};\nconst excludeId = ctx.lookup?.event_id || null;\n\nconst parse = v => v ? DateTime.fromISO(String(v), { zone: tz }) : null;\nlet start = parse(body.start?.dateTime);\nlet end = parse(body.end?.dateTime);\nif (start && !end) end = start.plus({ minutes: 60 });\n\nconst out = { checked: false, conflict: false, conflicts: [], suggestion: null, policy: ctx.config.conflictPolicy || 'reject', error: null };\nif (resp.error) out.error = resp.error.message || 'calendar lookup failed';\n\nif (start && end && !resp.error && out.policy !== 'allow') {\n  out.checked = true;\n  const busy = [];\n  for (const ev of resp.items || []) {\n    if (ev.status === 'cancelled' || ev.transparency === 'transparent') continue;   // \"free\" events don't block\n    if (excludeId && ev.id === excludeId) continue;                                 // the event being moved\n    if (!ev.start?.dateTime || !ev.end?.dateTime) continue;                          // all-day events don't block\n    const s = DateTime.fromISO(ev.start.dateTime), e = DateTime.fromISO(ev.end.dateTime);\n    if (s.isValid && e.isValid) busy.push({ id: ev.id, summary: ev.summary || '(untitled)', start: s, end: e });\n  }\n  busy.sort((a, b) => a.start - b.start);\n  out.conflicts = busy.filter(b => b.start < end && b.end > start).map(b => ({\n    id: b.id, summary: b.summary,\n    start: b.start.setZone(tz).toFormat(\"ccc d LLL, HH:mm\"), end: b.end.setZone(tz).toFormat('HH:mm'),\n  }));\n  out.conflict = out.conflicts.length > 0;\n\n  if (out.conflict) {\n    // next gap of the same length, same day, before workdayEnd (default 21:00)\n    const duration = end.diff(start);\n    const dayEnd = start.set({ hour: ctx.config.workdayEnd ?? 21, minute: 0, second: 0 });\n    let cand = start;\n    for (let i = 0; i < 50 && cand.plus(duration) <= dayEnd; i++) {\n      const hit = busy.find(b => b.start < cand.plus(duration) && b.end > cand);\n      if (!hit) { out.suggestion = { start: cand.toFormat(\"yyyy-MM-dd'T'HH:mm:ss\"), label: `${cand.toFormat('HH:mm')}–${cand.plus(duration).toFormat('HH:mm')}` }; break; }\n      cand = hit.end.setZone(tz);\n    }\n  }\n}\nreturn [{ json: { ...ctx, slot: out } }];\n"
+      },
+      "id": "678fa499-3b7c-522f-9fc8-68f6eab17da4",
+      "name": "Detect Conflict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3800,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "51e1a848-ed50-588d-b880-5b145db32ec3",
+              "leftValue": "={{ !$json.slot.conflict }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ae1e6ed7-892f-5932-80bd-8af8b9d8f08d",
+      "name": "Slot Free?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4000,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b5d8ed5c-db9b-519b-a419-e4aeeecf41c5",
+              "leftValue": "={{ $json.stage3.command.method === 'POST' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4d903428-4169-540d-8937-19353e31957a",
+      "name": "Create Op?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sendUpdates",
+              "value": "none"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.stage3.command.body) }}"
+      },
+      "id": "593bf03b-7877-5e94-84cb-af69bf60843f",
+      "name": "Create Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4400,
+        0
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $now.minus({ days: 1 }).toUTC().toISO() }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $now.plus({ days: 90 }).toUTC().toISO() }}"
+            },
+            {
+              "name": "timeZone",
+              "value": "={{ $json.config.timezone }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "250"
+            }
+          ]
+        }
+      },
+      "id": "a787d726-65cb-5692-b28f-4f81ddc01cc7",
+      "name": "Find Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2980,
+        400
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Pick Event ──────────────────────────────────────────────────────────────\n// Chooses the existing calendar event that a modify/cancel message refers to,\n// by title similarity and (when known) start-time proximity.\nconst ctx = $('Validate Command').first().json;\nconst resp = $input.first().json;\nconst target = ctx.stage3.command.target || {};\nconst STOP = new Set(['the', 'a', 'an', 'with', 'and', 'of', 'for', 'to', 'on', 'our', 'meeting', 'call']);\nconst tokens = s => new Set(String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t && !STOP.has(t)));\n\nconst want = tokens(target.summary);\nconst wantStart = target.start_datetime ? Date.parse(String(target.start_datetime).slice(0, 19)) : NaN;\n\nlet best = null, bestScore = 0;\nfor (const ev of resp.items || []) {\n  if (ev.status === 'cancelled') continue;\n  const have = tokens(ev.summary);\n  const inter = [...want].filter(t => have.has(t)).length;\n  const union = new Set([...want, ...have]).size || 1;\n  let score = inter / union;\n  const evStart = Date.parse(String(ev.start?.dateTime || ev.start?.date || '').slice(0, 19));\n  if (!isNaN(wantStart) && !isNaN(evStart)) {\n    const diffH = Math.abs(evStart - wantStart) / 3.6e6;\n    if (diffH <= 1) score += 1; else if (diffH <= 24) score += 0.3;\n  }\n  if (score > bestScore) { bestScore = score; best = ev; }\n}\n\nconst found = !!best && bestScore >= 0.3;\nreturn [{\n  json: {\n    ...ctx,\n    lookup: {\n      found,\n      score: Number(bestScore.toFixed(2)),\n      event_id: found ? best.id : null,\n      event_summary: found ? best.summary : null,\n      error: resp.error ? (resp.error.message || 'calendar lookup failed') : null,\n    },\n  },\n}];\n"
+      },
+      "id": "ccf62e76-a960-5639-8e26-beabc44b8b9f",
+      "name": "Pick Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3180,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ad729132-bfe7-55fd-81bf-f72bbe8a4bdb",
+              "leftValue": "={{ $json.lookup.found }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "50bbef59-1191-5a22-9091-676cac34dd8b",
+      "name": "Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3380,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "697e479f-b090-5aaf-ad7b-97de66d59645",
+              "leftValue": "={{ $json.stage3.command.method === 'DELETE' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "df62080f-373f-509c-ba7c-6b594c757e21",
+      "name": "Cancel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3580,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events/' + $json.lookup.event_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sendUpdates",
+              "value": "none"
+            }
+          ]
+        }
+      },
+      "id": "91461cf2-fbff-534d-9039-2f97083934bc",
+      "name": "Delete Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3800,
+        200
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events/' + $json.lookup.event_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sendUpdates",
+              "value": "none"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.stage3.command.body) }}"
+      },
+      "id": "2eab6c6b-1841-53e3-967a-e98c1d4ce26a",
+      "name": "Patch Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4400,
+        200
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Finalize ────────────────────────────────────────────────────────────────\n// Every branch ends here. Works out what happened, builds the Telegram reply\n// (if any) and the audit record.\nconst ran = name => { try { return $(name).isExecuted; } catch (e) { return false; } };\nconst last = name => $(name).first().json;\nconst input = $input.first().json;\n\nlet ctx, status, result = null;\nif (ran('Create Event') || ran('Patch Event') || ran('Delete Event')) {\n  ctx = ran('Restore Pending') ? last('Restore Pending') : ran('Pick Event') ? last('Pick Event') : last('Validate Command');\n  result = input;\n  if (input.error) status = 'calendar_error';\n  else status = ran('Create Event') ? 'created' : ran('Patch Event') ? 'modified' : 'cancelled';\n} else if (ran('Ask Owner')) {\n  ctx = last('Prepare Confirmation'); status = 'pending';          // waiting for ✅ / ❌\n} else if (ran('Restore Pending')) {\n  ctx = last('Restore Pending'); status = ctx.expired ? 'expired' : 'skipped';\n} else if (ran('Detect Conflict')) {\n  ctx = last('Detect Conflict'); status = ctx.slot.error ? 'calendar_error' : 'conflict';\n} else if (ran('Pick Event')) {\n  ctx = last('Pick Event'); status = 'event_not_found';\n} else if (ran('Validate Command')) {\n  ctx = last('Validate Command'); status = 'invalid_command';\n} else if (ran('Parse Stage 2')) {\n  ctx = last('Parse Stage 2'); status = 'entity_failed';\n} else {\n  ctx = last('Parse Stage 1'); status = 'discarded';\n}\n\nconst fmt = iso => iso ? DateTime.fromISO(String(iso).slice(0, 19)).toFormat(\"ccc d LLL yyyy, HH:mm\") : '';\nconst ent = ctx.stage2?.entities || {};\nconst body = ctx.stage3?.command?.body || {};\nlet reply = null;\nswitch (status) {\n  case 'created':\n    reply = `✅ Added to calendar: ${body.summary}\\n🕒 ${fmt(body.start?.dateTime)} – ${fmt(body.end?.dateTime).split(', ')[1]}` +\n            (body.location ? `\\n📍 ${body.location}` : '') +\n            (ent.participants?.length ? `\\n👥 ${ent.participants.join(', ')}` : '') +\n            (result?.htmlLink ? `\\n${result.htmlLink}` : '');\n    break;\n  case 'modified':\n    reply = `✏️ Updated: ${ctx.lookup.event_summary}` + (body.start?.dateTime ? `\\n🕒 now ${fmt(body.start.dateTime)}` : '');\n    break;\n  case 'cancelled':\n    reply = `🗑️ Cancelled: ${ctx.lookup.event_summary}`;\n    break;\n  case 'conflict': {\n    const c = ctx.slot.conflicts[0];\n    const verb = ctx.stage2.intent === 'modify' ? 'Not moved' : 'Not added';\n    reply = `⚠️ ${verb} — that slot is already taken by \"${c.summary}\" (${c.start}–${c.end})` +\n            (ctx.slot.conflicts.length > 1 ? ` and ${ctx.slot.conflicts.length - 1} more` : '') + '.' +\n            (ctx.slot.suggestion ? `\\n💡 Next free slot that day: ${ctx.slot.suggestion.label}.` : '') +\n            `\\nSend a different time and I'll schedule \"${ent.event_title}\".`;\n    break;\n  }\n  case 'event_not_found':\n    reply = `⚠️ I couldn't find a calendar event matching \"${ctx.stage3.command.target?.summary}\". Nothing was changed.`;\n    break;\n  case 'invalid_command':\n  case 'calendar_error':\n    reply = `⚠️ I understood this as a scheduling request (\"${ent.event_title || '?'}\") but couldn't write it to the calendar. Please add it manually.`;\n    break;\n  // 'discarded', 'entity_failed', 'pending', 'skipped', 'expired' stay silent (the card already says it)\n}\nif (!ctx.config.sendConfirmation || !ctx.meta.reply_chat_id) reply = null;\nif (ctx.kind === 'callback' && status !== 'created' && status !== 'modified' && status !== 'calendar_error') reply = null;\nif (reply && ctx.meta.business) {\n  const quote = ctx.text.length > 120 ? ctx.text.slice(0, 117) + '…' : ctx.text;\n  reply = `💬 ${ctx.meta.sender} in chat with ${ctx.meta.counterpart}: \"${quote}\"\\n\\n` + reply;\n}\n\nconst payload = {\n  stage1: ctx.stage1 || null,\n  stage2: ctx.stage2 || null,\n  stage3: ctx.stage3 ? { attempt: ctx.stage3.attempt, valid: ctx.stage3.valid, errors: ctx.stage3.errors, command: ctx.stage3.command } : null,\n  lookup: ctx.lookup || null,\n  slot: ctx.slot || null,\n  pending_id: ctx.pending_id || null,\n  calendar_event_id: result?.id || ctx.lookup?.event_id || null,\n  calendar_error: result?.error ? (result.error.message || String(result.error)) : null,\n};\nif (ctx.config.logMessageText) payload.text = ctx.text;\nelse if (payload.stage1) { payload.stage1 = { ...payload.stage1 }; delete payload.stage1.normalised_message; }\n\nreturn [{\n  json: {\n    chat_id: String(ctx.meta.chat_id),\n    message_id: String(ctx.meta.message_id),\n    reply_chat_id: ctx.meta.reply_chat_id ? String(ctx.meta.reply_chat_id) : null,\n    reply_to: ctx.meta.reply_to || null,\n    status,\n    intent: ctx.stage2?.intent || null,\n    latency_ms: Date.now() - ctx.meta.received_at_ms,\n    stage3_attempts: ctx.stage3?.attempt || 0,\n    has_reply: !!reply,\n    reply,\n    payload,\n  },\n}];\n"
+      },
+      "id": "d504ae76-7402-5b28-9c55-47ff56502552",
+      "name": "Finalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "75373aa4-92a9-5aff-9050-0e5f31475e87",
+              "leftValue": "={{ $json.has_reply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd0e8e31-a0c6-5e96-a381-1ab185639603",
+      "name": "Has Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.reply_chat_id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "11fb0701-f2df-5d3b-bf29-6fdc865a12aa",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        5100,
+        220
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO scheduling_audit (chat_id, message_id, status, intent, latency_ms, stage3_attempts, payload)\nVALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [ $('Finalize').first().json.chat_id, $('Finalize').first().json.message_id, $('Finalize').first().json.status, $('Finalize').first().json.intent, $('Finalize').first().json.latency_ms, $('Finalize').first().json.stage3_attempts, JSON.stringify($('Finalize').first().json.payload) ] }}"
+        }
+      },
+      "id": "daf19dda-6ab2-5634-b7af-624a4e59c4bf",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        5300,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "schedPostgres0001",
+          "name": "Audit Postgres"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Input": {
+      "main": [
+        [
+          {
+            "node": "Callback?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Save Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Pending": {
+      "main": [
+        [
+          {
+            "node": "Ask Owner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask Owner": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Pending": {
+      "main": [
+        [
+          {
+            "node": "Restore Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Pending": {
+      "main": [
+        [
+          {
+            "node": "Answer Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Callback": {
+      "main": [
+        [
+          {
+            "node": "Edit Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Card": {
+      "main": [
+        [
+          {
+            "node": "Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1 LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse Stage 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Stage 1": {
+      "main": [
+        [
+          {
+            "node": "Scheduling?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 2 LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse Stage 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Stage 2": {
+      "main": [
+        [
+          {
+            "node": "Entities OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Stage 3 Request": {
+      "main": [
+        [
+          {
+            "node": "Stage 3 LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 3 LLM": {
+      "main": [
+        [
+          {
+            "node": "Validate Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Command": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Events": {
+      "main": [
+        [
+          {
+            "node": "Pick Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Event": {
+      "main": [
+        [
+          {
+            "node": "Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Conflicts": {
+      "main": [
+        [
+          {
+            "node": "Detect Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Conflict": {
+      "main": [
+        [
+          {
+            "node": "Slot Free?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Event": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Event": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Event": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize": {
+      "main": [
+        [
+          {
+            "node": "Has Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Callback?": {
+      "main": [
+        [
+          {
+            "node": "Load Pending",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stage 1 LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Needed?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Op?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Create Op?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scheduling?": {
+      "main": [
+        [
+          {
+            "node": "Stage 2 LLM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Entities OK?": {
+      "main": [
+        [
+          {
+            "node": "Build Stage 3 Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Create?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Build Stage 3 Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create?": {
+      "main": [
+        [
+          {
+            "node": "Find Conflicts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Found?": {
+      "main": [
+        [
+          {
+            "node": "Cancel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancel?": {
+      "main": [
+        [
+          {
+            "node": "Delete Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Conflicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Free?": {
+      "main": [
+        [
+          {
+            "node": "Confirm Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Op?": {
+      "main": [
+        [
+          {
+            "node": "Create Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Patch Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Reply?": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": []
+}

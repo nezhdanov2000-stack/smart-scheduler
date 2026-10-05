@@ -1,0 +1,240 @@
+{
+  "id": "schedaaf84e14b88",
+  "name": "Smart Scheduling - Single-Model Baseline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Single-model baseline\nOne GPT-4o-mini call does filtering, extraction and command synthesis at once. For comparison only - it handles `create` and has no retry. Keep it **inactive** while the three-stage pipeline is active: a Telegram bot can only have one webhook.",
+        "width": 1500,
+        "height": 440
+      },
+      "id": "5c905130-87a3-508d-b1dc-bd2710ca641b",
+      "name": "Note: Baseline",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "72fda541-15b3-572d-841b-d486caec021d",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "schedTelegram0001",
+          "name": "Telegram Bot"
+        }
+      },
+      "webhookId": "89286a4c-ad5d-52cf-9cb7-a6a442aaf97c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Baseline: Prepare Input ─────────────────────────────────────────────────\nconst CONFIG = { model: 'gpt-4o-mini', timezone: 'Asia/Bangkok', calendarId: 'primary' };\nconst BASELINE_PROMPT = \"You are a scheduling assistant. Given a Telegram message and the current date/time, perform all of the following tasks:\\n1. Determine if the message contains actionable scheduling intent. If no, output {\\\"is_scheduling\\\": false} and stop.\\n2. If yes, classify the intent (\\\"create\\\", \\\"modify\\\", \\\"cancel\\\").\\n3. Extract event_title, start_datetime (ISO 8601), end_datetime (ISO 8601 or null), location (or null), and participants (list). Infer a 60-minute duration if end_datetime is not specified.\\n4. Produce a JSON request body conforming to the Google Calendar Events API v3 schema for the extracted entities.\\nOutput a single JSON object containing: \\\"is_scheduling\\\", \\\"intent\\\", \\\"entities\\\", and \\\"api_command\\\". Do not include any text outside the JSON object.\";\n\nconst msg = $input.first().json.message;\nif (!msg || typeof msg.text !== 'string' || !msg.text.trim() || msg.text.startsWith('/')) return [];\nconst now = $now.setZone(CONFIG.timezone);\nconst nowIso = now.toFormat(\"yyyy-MM-dd'T'HH:mm:ss\");\nreturn [{\n  json: {\n    config: CONFIG,\n    text: msg.text.trim(),\n    request: {\n      model: CONFIG.model,\n      temperature: 0,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: BASELINE_PROMPT },\n        { role: 'user', content: `Current date/time: ${nowIso} (${now.toFormat('cccc')}), timezone ${CONFIG.timezone}\\nMessage: ${msg.text.trim()}` },\n      ],\n    },\n  },\n}];\n"
+      },
+      "id": "8a43f3ae-0dcb-53bb-a46f-ae92e8a17eba",
+      "name": "Prepare Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "2f1fa172-d798-5e94-8a2c-02d12b85a426",
+      "name": "Single LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "schedOpenAi000001",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Baseline: Parse Output ──────────────────────────────────────────────────\nconst ctx = $('Prepare Input').first().json;\nlet out = {};\ntry { out = JSON.parse($input.first().json.choices[0].message.content); } catch (e) { out = { parse_error: true }; }\nconst ok = out.is_scheduling === true && out.intent === 'create' && out.api_command && typeof out.api_command === 'object';\nreturn [{ json: { config: ctx.config, ...out, ok } }];\n"
+      },
+      "id": "4d70b29e-9309-5eaf-b28b-e04ae591d303",
+      "name": "Parse Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "42f2d0bb-356b-59a1-81a3-bfc2640294d2",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27b501ed-310d-5a28-93ea-fc3eeb122f8d",
+      "name": "Create?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.config.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 30000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sendUpdates",
+              "value": "none"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.api_command) }}"
+      },
+      "id": "593bf03b-7877-5e94-84cb-af69bf60843f",
+      "name": "Create Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        220
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "schedGoogleCal001",
+          "name": "Google Calendar OAuth2"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Input": {
+      "main": [
+        [
+          {
+            "node": "Single LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Single LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Output": {
+      "main": [
+        [
+          {
+            "node": "Create?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create?": {
+      "main": [
+        [
+          {
+            "node": "Create Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": []
+}
