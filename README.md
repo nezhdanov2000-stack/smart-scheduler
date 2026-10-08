@@ -33,6 +33,7 @@ a Cloudflare quick tunnel for the Telegram webhook. No Docker, no Redis, no Post
 | `evaluation/evaluate.py` | Pipeline-vs-baseline evaluation: intent, entities, command validity, message flow, latency |
 | `scripts/build_workflows.py` | Rebuilds the workflow JSON from `prompts/` + `workflows/src/` |
 | `tests/test_code_nodes.js` | Offline smoke test of the Code-node logic |
+| `docs/` | Capstone project documentation: Final Report (PDF) and Presentation slides (PPTX) |
 
 ## Install (Windows, once)
 
