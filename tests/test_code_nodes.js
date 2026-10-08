@@ -5,11 +5,12 @@ const fs = require('fs'), path = require('path'), assert = require('assert');
 const { DateTime } = require('luxon');
 const SRC = path.join(__dirname, '..', 'workflows', 'src');
 const outputs = {};
+const staticData = {};   // stands in for n8n's $getWorkflowStaticData('global')
 function run(file, nodeName, inputJson) {
   let code = fs.readFileSync(path.join(SRC, file), 'utf8').replace(/__STAGE\d_PROMPT__/g, '"PROMPT"');
   const $ = n => ({ first: () => ({ json: outputs[n] }), isExecuted: n in outputs });
-  const fn = new Function('$input', '$', '$now', 'DateTime', code);
-  const res = fn({ first: () => ({ json: inputJson }) }, $, DateTime.fromISO('2025-06-15T10:00:00', { zone: 'Asia/Bangkok' }), DateTime);
+  const fn = new Function('$input', '$', '$now', 'DateTime', '$getWorkflowStaticData', code);
+  const res = fn({ first: () => ({ json: inputJson }) }, $, DateTime.fromISO('2025-06-15T10:00:00', { zone: 'Asia/Bangkok' }), DateTime, () => staticData);
   if (res.length) outputs[nodeName] = res[0].json;
   return res.length ? res[0].json : null;
 }
@@ -108,21 +109,27 @@ o = run('detect_conflict.js', 'Detect Conflict', { items: [] });
 o = run('prepare_confirmation.js', 'Prepare Confirmation', o);
 assert.ok(o.ask_text.includes('Anna in chat with Anna') && o.ask_text.includes('Catch-up') && o.ask_text.includes('15:00'));
 console.log(o.ask_text);
+o = run('save_pending.js', 'Save Pending', o);
+const pendingId = o.id;
+assert.ok(pendingId >= 1 && staticData.pending[pendingId].status === 'pending');
 outputs['Ask Owner'] = {};
 o = run('finalize.js', 'Finalize', {});
 assert.ok(o.status === 'pending' && o.reply === null);
 // ...button pressed
-const saved = JSON.parse(JSON.stringify(outputs['Prepare Confirmation']));
 for (const k of Object.keys(outputs)) delete outputs[k];
-run('prepare_input.js', 'Prepare Input', { callback_query: { id: 'q1', data: 'ok:42', from: { id: 845660052 }, message: { chat: { id: 845660052 }, message_id: 9, text: 'card' } } });
-assert.strictEqual(outputs['Prepare Input'].callback.pending_id, 42);
-o = run('restore_pending.js', 'Restore Pending', { id: 42, ctx: saved });
+run('prepare_input.js', 'Prepare Input', { callback_query: { id: 'q1', data: `ok:${pendingId}`, from: { id: 845660052 }, message: { chat: { id: 845660052 }, message_id: 9, text: 'card' } } });
+assert.strictEqual(outputs['Prepare Input'].callback.pending_id, pendingId);
+o = run('load_pending.js', 'Load Pending', outputs['Prepare Input']);
+assert.ok(o.ctx && staticData.pending[pendingId].status === 'approved');
+o = run('restore_pending.js', 'Restore Pending', o);
 assert.ok(o.approved && !o.expired && o.stage3.command.method === 'POST' && o.edit_text.endsWith('⏳ Adding…'));
 outputs['Create Event'] = {};
 o = run('finalize.js', 'Finalize', { id: 'evt2', htmlLink: 'https://calendar.google.com/y' });
 assert.ok(o.status === 'created' && o.reply.includes('Catch-up') && o.reply_chat_id === '845660052', o.reply);
 delete outputs['Create Event'];
-o = run('restore_pending.js', 'Restore Pending', {});     // already handled
+o = run('load_pending.js', 'Load Pending', outputs['Prepare Input']);   // second press on the same card
+assert.deepStrictEqual(o, {});
+o = run('restore_pending.js', 'Restore Pending', o);     // already handled
 assert.ok(o.expired && !o.approved);
 o = run('finalize.js', 'Finalize', o);
 assert.ok(o.status === 'expired' && o.reply === null);

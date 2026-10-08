@@ -3,7 +3,7 @@
 
 Single source of truth: edit a prompt or a Code-node script, then run
     python scripts/build_workflows.py
-and re-import workflows/*.json into n8n.
+and re-import workflows/*.json into n8n (Windows: start.ps1 -Reimport).
 """
 import json
 import uuid
@@ -19,7 +19,6 @@ CRED = {
     "telegramApi": {"id": "schedTelegram0001", "name": "Telegram Bot"},
     "openAiApi": {"id": "schedOpenAi000001", "name": "OpenAI"},
     "googleCalendarOAuth2Api": {"id": "schedGoogleCal001", "name": "Google Calendar OAuth2"},
-    "postgres": {"id": "schedPostgres0001", "name": "Audit Postgres"},
 }
 
 
@@ -62,13 +61,6 @@ def llm(name, pos):
         "jsonBody": "={{ JSON.stringify($json.request) }}",
         "options": {"timeout": 30000},
     }, ["openAiApi"], retryOnFail=True, maxTries=4, waitBetweenTries=5000)
-
-
-def pg(name, pos, query, replacement, **extra):
-    return node(name, "n8n-nodes-base.postgres", 2.5, pos, {
-        "operation": "executeQuery", "query": query,
-        "options": {"queryReplacement": replacement},
-    }, ["postgres"], **extra)
 
 
 def tg(name, pos, params, **extra):
@@ -130,8 +122,8 @@ def build_pipeline():
     y = 300
     nodes = [
         sticky("Note: Ingestion", (-60, 100), (420, 380),
-               "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API. "
-               "In queue mode the execution is pushed to Redis/BullMQ and picked up by a worker.\n\n"
+               "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API "
+               "(public URL via the Cloudflare tunnel).\n\n"
                "**Edit `CONFIG` in _Prepare Input_** (timezone, calendar, retries)."),
         sticky("Note: Stage 1", (400, 100), (640, 380),
                "## Stage 1 · Context filtering & temporal normalisation\nBinary scheduling-intent detection; "
@@ -147,8 +139,8 @@ def build_pipeline():
                "existing events: an overlap stops the operation and the user gets a warning with the next free slot. "
                "Each call retries 4 × 5 s on transient failures.", 3),
         sticky("Note: Output", (4640, 100), (900, 560),
-               "## Confirmation & audit trail\nTelegram reply + one row in `scheduling_audit` (PostgreSQL).\n\n"
-               "**Ask before adding**: when `confirmBefore` applies, the event is parked in `pending_actions` and the owner "
+               "## Confirmation\nTelegram reply to the chat (or to the owner for Telegram Business messages).\n\n"
+               "**Ask before adding**: when `confirmBefore` applies, the event is parked in the workflow's static data and the owner "
                "gets a card with ✅ / ❌. The button press comes back through the trigger as a callback_query "
                "(*Callback?* branch, bottom-left), the saved context is restored and the calendar nodes run."),
 
@@ -165,9 +157,7 @@ def build_pipeline():
                 "={{ !!$json.meta.reply_chat_id && ($json.config.confirmBefore === 'all' || "
                 "($json.config.confirmBefore === 'business' && $json.meta.business)) }}"),
         code("Prepare Confirmation", (4400, y - 520), js("prepare_confirmation.js")),
-        pg("Save Pending", (4600, y - 520),
-           "INSERT INTO pending_actions (chat_id, ctx) VALUES ($1, $2::jsonb) RETURNING id;",
-           "={{ [ String($json.meta.reply_chat_id), JSON.stringify($json) ] }}"),
+        code("Save Pending", (4600, y - 520), js("save_pending.js")),
         tg("Ask Owner", (4800, y - 520), {
             "resource": "message", "operation": "sendMessage",
             "chatId": "={{ $('Prepare Confirmation').first().json.meta.reply_chat_id }}",
@@ -179,11 +169,7 @@ def build_pipeline():
             "additionalFields": {"appendAttribution": False},
         }),
         # ── button pressed ──
-        pg("Load Pending", (600, y + 500),
-           "UPDATE pending_actions SET status = $2, resolved_at = now() "
-           "WHERE id = $1 AND status = 'pending' RETURNING id, ctx;",
-           "={{ [ $json.callback.pending_id, $json.callback.action === 'ok' ? 'approved' : 'skipped' ] }}",
-           alwaysOutputData=True),
+        code("Load Pending", (600, y + 500), js("load_pending.js")),
         code("Restore Pending", (800, y + 500), js("restore_pending.js")),
         tg("Answer Callback", (1000, y + 500), {
             "resource": "callback", "operation": "answerQuery",
@@ -245,20 +231,7 @@ def build_pipeline():
             "chatId": "={{ $json.reply_chat_id }}", "text": "={{ $json.reply }}",
             "additionalFields": {"appendAttribution": False},
         }, ["telegramApi"], retryOnFail=True, maxTries=3, waitBetweenTries=3000, onError="continueRegularOutput"),
-        node("Audit Log", "n8n-nodes-base.postgres", 2.5, (4540, y), {
-            "operation": "executeQuery",
-            "query": "INSERT INTO scheduling_audit (chat_id, message_id, status, intent, latency_ms, stage3_attempts, payload)\n"
-                     "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
-            "options": {"queryReplacement":
-                        "={{ [ $('Finalize').first().json.chat_id, $('Finalize').first().json.message_id, "
-                        "$('Finalize').first().json.status, $('Finalize').first().json.intent, "
-                        "$('Finalize').first().json.latency_ms, $('Finalize').first().json.stage3_attempts, "
-                        "JSON.stringify($('Finalize').first().json.payload) ] }}"},
-        }, ["postgres"], onError="continueRegularOutput"),
     ]
-    for n in nodes:
-        if n["name"] == "Audit Log":
-            n["position"] = [5300, y]
     c = {}
     for a, b in [("Telegram Trigger", "Prepare Input"), ("Prepare Input", "Callback?"), ("Prepare Confirmation", "Save Pending"),
                  ("Save Pending", "Ask Owner"), ("Ask Owner", "Finalize"),
@@ -270,7 +243,7 @@ def build_pipeline():
                  ("Validate Command", "Valid?"), ("Find Events", "Pick Event"), ("Pick Event", "Found?"),
                  ("Find Conflicts", "Detect Conflict"), ("Detect Conflict", "Slot Free?"),
                  ("Create Event", "Finalize"), ("Delete Event", "Finalize"), ("Patch Event", "Finalize"),
-                 ("Finalize", "Has Reply?"), ("Send Confirmation", "Audit Log")]:
+                 ("Finalize", "Has Reply?")]:
         connect(c, a, b)
     for src, yes, no in [("Callback?", "Load Pending", "Stage 1 LLM"),
                          ("Confirm Needed?", "Prepare Confirmation", "Create Op?"),
@@ -284,9 +257,10 @@ def build_pipeline():
                          ("Cancel?", "Delete Event", "Find Conflicts"),
                          ("Slot Free?", "Confirm Needed?", "Finalize"),
                          ("Create Op?", "Create Event", "Patch Event"),
-                         ("Has Reply?", "Send Confirmation", "Audit Log")]:
+                         ]:
         connect(c, src, yes, 0)
         connect(c, src, no, 1)
+    connect(c, "Has Reply?", "Send Confirmation", 0)
     return workflow("Smart Scheduling - Three-Stage LLM Pipeline", nodes, c)
 
 

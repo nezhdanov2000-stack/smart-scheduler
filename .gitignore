@@ -1,5 +1,7 @@
 .env
-*.log
+.n8n/
 __pycache__/
 evaluation/results/
-.bootstrapped
+*.log
+node_modules/
+cloudflared.exe

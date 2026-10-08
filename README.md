@@ -12,51 +12,68 @@ Telegram webhook ─► Stage 1  filter + temporal normalisation ──(not sche
                     Stage 2  intent (create/modify/cancel) + entity extraction
                     Stage 3  Calendar API command synthesis ─► schema validation ─┐
                                         ▲──── prompt-adjusted retry on failure ◄──┘
-                    Google Calendar API (POST / PATCH / DELETE) ─► Telegram confirmation ─► audit log
+                    Google Calendar API (POST / PATCH / DELETE) ─► Telegram confirmation
 ```
+
+Everything runs on one Windows laptop: n8n installed with npm (its built-in SQLite database),
+a Cloudflare quick tunnel for the Telegram webhook. No Docker, no Redis, no PostgreSQL.
 
 ## What is in the box
 
 | Path | Purpose |
 |---|---|
-| `docker-compose.yml`, `.env.example`, `start.ps1` | Self-hosted stack: n8n (main + worker, queue mode), Redis/BullMQ, PostgreSQL |
-| `workflows/scheduling_pipeline.json` | The three-stage pipeline (import into n8n) |
-| `workflows/baseline_single_model.json` | Single-model baseline workflow |
-| `workflows/src/*.js` | Source of every Code node (validator, retry logic, event lookup, audit) |
+| `start.ps1` / `start.bat` | One-click start: tunnel → `.env` → first-run import → `n8n start` |
+| `.env.example` | Template for your local secrets (`.env`) |
+| `workflows/scheduling_pipeline.json` | The three-stage pipeline (imported into n8n automatically) |
+| `workflows/baseline_single_model.json` | Single-model baseline workflow (kept inactive) |
+| `workflows/src/*.js` | Source of every Code node (validator, retry logic, event lookup, confirmation flow) |
 | `prompts/*.txt` | Stage 1–3 and baseline system prompts |
 | `schema/calendar_command.schema.json` | JSON Schema the Stage 3 output is validated against |
-| `db/init.sql` | `scheduling_audit` table (audit trail) |
 | `dataset/telegram_scheduling_120.jsonl` | 120-message evaluation set with ground truth |
 | `evaluation/evaluate.py` | Pipeline-vs-baseline evaluation: intent, entities, command validity, message flow, latency |
 | `scripts/build_workflows.py` | Rebuilds the workflow JSON from `prompts/` + `workflows/src/` |
 | `tests/test_code_nodes.js` | Offline smoke test of the Code-node logic |
 
-## Setup
+## Install (Windows, once)
 
-Secrets live only in your local `.env` (git-ignored) and in n8n's encrypted vault. You need: a Telegram
-bot token (@BotFather), an OpenAI API key and a Google Cloud OAuth client. Telegram only delivers
-webhooks over HTTPS; the bundled Cloudflare tunnel takes care of that.
+1. **Node.js 22 LTS** — <https://nodejs.org>. n8n requires a Node.js version between 20.19 and 24.x
+   (inclusive); 22 LTS is the safe choice. Check with `node -v`.
+2. **n8n** — in PowerShell: `npm install n8n -g`. Check with `n8n --version`.
+3. **cloudflared** — `winget install Cloudflare.cloudflared`, or download `cloudflared-windows-amd64.exe`
+   from Cloudflare, rename it to `cloudflared.exe` and put it in this folder. No Cloudflare account is needed.
+4. **Keys** — copy `.env.example` to `.env` and fill in:
+   - `N8N_ENCRYPTION_KEY`: 64 random hex characters (`openssl rand -hex 32`, or any password generator).
+     Never change it later — it decrypts the stored credentials.
+   - `OPENAI_API_KEY` (platform.openai.com) and `TELEGRAM_BOT_TOKEN` (@BotFather).
+   - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`: in Google Cloud enable the **Google Calendar API**,
+     create an OAuth client of type *Web application* with redirect URI
+     `http://localhost:5678/rest/oauth2-credential/callback`, and add your Gmail as a test user on the
+     consent screen.
 
-1. `cp .env.example .env` and fill it in: passwords, `N8N_ENCRYPTION_KEY` (`openssl rand -hex 32`),
-   `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and the Google OAuth client ID/secret.
-   In Google Cloud: enable the **Google Calendar API**, create an OAuth client of type *Web application*
-   with the redirect URI `http://localhost:5678/rest/oauth2-credential/callback` (Google allows plain
-   http for localhost), and add yourself as a test user on the consent screen.
-2. Windows: `powershell -ExecutionPolicy Bypass -File .\start.ps1` (Docker Desktop running).
-   The script opens a Cloudflare quick tunnel (no account needed) for the Telegram webhook, starts the
-   stack and, on the first run, imports the credentials into n8n's encrypted vault and both workflows.
-   Run it again after every reboot: the quick-tunnel URL changes, and n8n re-registers the webhook on start.
-3. Open <http://localhost:5678>, create the owner account, then **Credentials → Google Calendar OAuth2 →
-   Sign in with Google**.
-4. Open the workflow *Smart Scheduling - Three-Stage LLM Pipeline*, adjust `CONFIG` in **Prepare Input**
-   (timezone, calendar ID, retries, allowed chats) and **activate** it. In group chats, disable the bot's
-   privacy mode in @BotFather (`/setprivacy` → Disable) so it can read all messages.
+## Run
 
-For a permanent deployment replace the quick tunnel with a fixed HTTPS URL (named Cloudflare tunnel,
-ngrok static domain or a reverse proxy) and set `WEBHOOK_URL` in `.env`.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1     # or double-click start.bat
+```
 
-Send the bot *"Let's meet tomorrow at 4pm with Anna to review the budget"* — the event should
-appear in the calendar and the bot replies with a confirmation.
+The script opens the tunnel, writes its URL into `.env`, on the first run imports the credentials into
+n8n's encrypted vault and both workflows, then starts n8n in the same window. **Ctrl+C** stops both.
+Run it again after every reboot — the tunnel URL changes and n8n re-registers the Telegram webhook on start.
+
+First time only, in the browser:
+
+1. Open <http://localhost:5678> and create the owner account (local, your laptop only).
+2. **Credentials → Google Calendar OAuth2 → Sign in with Google** (accept the "unverified app" warning —
+   it is your own app).
+3. Optional: open the workflow *Smart Scheduling - Three-Stage LLM Pipeline* → **Prepare Input** and adjust
+   `CONFIG` (timezone, calendar ID, `ownerChatId`, `confirmBefore`). The workflow is already active.
+4. For group chats, disable the bot's privacy mode in @BotFather (`/setprivacy` → Disable).
+
+Send the bot *"Let's meet tomorrow at 4pm with Anna to review the budget"* — the event appears in the
+calendar and the bot replies with a confirmation.
+
+All n8n data (SQLite database, logs) lives in `.n8n\` inside this folder; delete it for a clean reinstall
+(you will have to create the owner account and sign in to Google again).
 
 ## Architecture and Key Features
 
@@ -70,17 +87,14 @@ appear in the calendar and the bot replies with a confirmation.
   requested slot with the events already in the calendar (all-day and "free" events don't block; the event
   being moved is ignored). On an overlap nothing is written: the bot replies with the conflicting event and
   the next free slot of the same length that day. `conflictPolicy: 'allow'` in `CONFIG` disables the check.
-  This includes intelligent conflict detection and slot suggestion.
 - **create / modify / cancel** — POST; for PATCH and DELETE the target event is located by title
   similarity and start-time proximity among upcoming events (*Find Events* → *Pick Event*).
-- **Reliability** — every external call retries 4 × 5 s (≈20 s recovery); queue mode gives
-  backpressure and at-least-once execution through Redis/BullMQ; add workers with
-  `docker compose up -d --scale n8n-worker=3`.
-- **Privacy** — self-hosted; only the LLM call leaves the host; raw message text is kept out of the audit
-  table by default (`logMessageText: false`); executions are pruned after 14 days; invitations are never
-  e-mailed to placeholder attendees (`sendUpdates=none`).
-- **Latency** — `scheduling_audit.latency_ms` records webhook-receipt → calendar-confirmation per message:
-  `SELECT status, count(*), round(avg(latency_ms)) FROM scheduling_audit GROUP BY 1;`
+- **Reliability** — every external call retries 4 × 5 s (≈20 s recovery); n8n keeps execution logs for
+  14 days (Executions tab).
+- **Privacy** — self-hosted; only the LLM call leaves the laptop; credentials live in n8n's encrypted vault;
+  invitations are never e-mailed to placeholder attendees (`sendUpdates=none`).
+- **Latency** — each execution's duration is visible in n8n's Executions tab; `evaluation/evaluate.py`
+  reports mean LLM latency per message.
 
 ## Telegram Business (your own private chats)
 
@@ -92,9 +106,9 @@ your private chat with the bot, prefixed with who said what — the bot never wr
 
 **Ask before adding.** With `confirmBefore: 'business'` (default) an event found in one of those chats is
 not written immediately: the bot sends you a card with the parsed event and ✅ Add / ❌ Skip buttons. The
-parsed context is parked in `pending_actions`; the button press comes back as a `callback_query`, the
-context is restored and the calendar operation runs (still with the conflict check already done). `'all'`
-asks for every message, `'none'` never asks. Requires `ownerChatId`.
+parsed context is parked in the workflow's static data (inside n8n's SQLite database); the button press
+comes back as a `callback_query`, the context is restored and the calendar operation runs (still with the
+conflict check already done). `'all'` asks for every message, `'none'` never asks. Requires `ownerChatId`.
 
 ## Dataset
 
@@ -117,16 +131,17 @@ Outputs `evaluation/results/summary.json` and per-message predictions for manual
 
 ## Development
 
-Prompts and Code-node scripts are the source of truth; after editing them run
-`python scripts/build_workflows.py`, then `update.bat` (Windows) re-imports the workflow into the running
-n8n and re-activates it. Test the node logic offline with
-`npm i luxon && node tests/test_code_nodes.js`.
+Prompts and Code-node scripts are the source of truth. After editing them:
+
+```powershell
+python scripts/build_workflows.py                    # regenerate workflows/*.json
+npm i luxon; node tests/test_code_nodes.js           # offline test of the node logic
+# stop n8n (Ctrl+C in its window), then re-import:
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Reimport
+```
 
 ## Known limitations
 
 English only · each message is processed in isolation (no conversation window) · no clarification
-dialogue · no multi-user conflict resolution.
-
-Skeleton status: the workflows have been validated structurally and their logic tested offline, but
-not yet executed on a live n8n instance (that needs the credentials above). Node `typeVersion`s target
-current n8n 1.x; if an import warns about a node version, open the node once and save it.
+dialogue · no multi-user conflict resolution · the quick-tunnel URL changes on every start (use a named
+Cloudflare tunnel or ngrok static domain for a permanent deployment and put it in `WEBHOOK_URL`).

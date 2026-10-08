@@ -4,7 +4,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API. In queue mode the execution is pushed to Redis/BullMQ and picked up by a worker.\n\n**Edit `CONFIG` in _Prepare Input_** (timezone, calendar, retries).",
+        "content": "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API (public URL via the Cloudflare tunnel).\n\n**Edit `CONFIG` in _Prepare Input_** (timezone, calendar, retries).",
         "width": 420,
         "height": 380
       },
@@ -83,7 +83,7 @@
     },
     {
       "parameters": {
-        "content": "## Confirmation & audit trail\nTelegram reply + one row in `scheduling_audit` (PostgreSQL).\n\n**Ask before adding**: when `confirmBefore` applies, the event is parked in `pending_actions` and the owner gets a card with ✅ / ❌. The button press comes back through the trigger as a callback_query (*Callback?* branch, bottom-left), the saved context is restored and the calendar nodes run.",
+        "content": "## Confirmation\nTelegram reply to the chat (or to the owner for Telegram Business messages).\n\n**Ask before adding**: when `confirmBefore` applies, the event is parked in the workflow's static data and the owner gets a card with ✅ / ❌. The button press comes back through the trigger as a callback_query (*Callback?* branch, bottom-left), the saved context is restored and the calendar nodes run.",
         "width": 900,
         "height": 560
       },
@@ -217,26 +217,16 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO pending_actions (chat_id, ctx) VALUES ($1, $2::jsonb) RETURNING id;",
-        "options": {
-          "queryReplacement": "={{ [ String($json.meta.reply_chat_id), JSON.stringify($json) ] }}"
-        }
+        "jsCode": "// ── Save Pending ────────────────────────────────────────────────────────────\n// Parks the pipeline context until the owner taps ✅ / ❌. Stored in the\n// workflow's static data (lives in n8n's own SQLite database - no external DB).\nconst sd = $getWorkflowStaticData('global');\nsd.pending = sd.pending || {};\nsd.nextId = (sd.nextId || 0) + 1;\nconst id = sd.nextId;\nconst now = Date.now();\nfor (const [k, v] of Object.entries(sd.pending)) {          // keep the store small\n  if (v.status !== 'pending' || now - v.created > 7 * 24 * 3600 * 1000) delete sd.pending[k];\n}\nsd.pending[id] = { created: now, status: 'pending', ctx: $input.first().json };\nreturn [{ json: { id } }];\n"
       },
       "id": "e0ac5a11-a7df-59f3-9b66-849f47a31559",
       "name": "Save Pending",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         4600,
         -220
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "schedPostgres0001",
-          "name": "Audit Postgres"
-        }
-      }
+      ]
     },
     {
       "parameters": {
@@ -292,27 +282,16 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE pending_actions SET status = $2, resolved_at = now() WHERE id = $1 AND status = 'pending' RETURNING id, ctx;",
-        "options": {
-          "queryReplacement": "={{ [ $json.callback.pending_id, $json.callback.action === 'ok' ? 'approved' : 'skipped' ] }}"
-        }
+        "jsCode": "// ── Load Pending ────────────────────────────────────────────────────────────\n// Claims the parked context for a button press (first press wins) and marks it\n// approved / skipped. Returns {} when nothing is pending for that id.\nconst cb = $input.first().json.callback;\nconst sd = $getWorkflowStaticData('global');\nconst row = sd.pending?.[cb.pending_id];\nif (!row || row.status !== 'pending') return [{ json: {} }];\nrow.status = cb.action === 'ok' ? 'approved' : 'skipped';\nrow.resolved = Date.now();\nconst ctx = row.ctx;\ndelete row.ctx;                                              // no longer needed once resolved\nreturn [{ json: { id: cb.pending_id, ctx } }];\n"
       },
       "id": "ca400c58-7893-5538-8a4c-22b4db915663",
       "name": "Load Pending",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         600,
         800
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "schedPostgres0001",
-          "name": "Audit Postgres"
-        }
-      },
-      "alwaysOutputData": true
+      ]
     },
     {
       "parameters": {
@@ -1219,30 +1198,6 @@
       "maxTries": 3,
       "waitBetweenTries": 3000,
       "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO scheduling_audit (chat_id, message_id, status, intent, latency_ms, stage3_attempts, payload)\nVALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
-        "options": {
-          "queryReplacement": "={{ [ $('Finalize').first().json.chat_id, $('Finalize').first().json.message_id, $('Finalize').first().json.status, $('Finalize').first().json.intent, $('Finalize').first().json.latency_ms, $('Finalize').first().json.stage3_attempts, JSON.stringify($('Finalize').first().json.payload) ] }}"
-        }
-      },
-      "id": "daf19dda-6ab2-5634-b7af-624a4e59c4bf",
-      "name": "Audit Log",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        5300,
-        300
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "schedPostgres0001",
-          "name": "Audit Postgres"
-        }
-      },
-      "onError": "continueRegularOutput"
     }
   ],
   "connections": {
@@ -1521,17 +1476,6 @@
         ]
       ]
     },
-    "Send Confirmation": {
-      "main": [
-        [
-          {
-            "node": "Audit Log",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Callback?": {
       "main": [
         [
@@ -1753,13 +1697,6 @@
         [
           {
             "node": "Send Confirmation",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Audit Log",
             "type": "main",
             "index": 0
           }
