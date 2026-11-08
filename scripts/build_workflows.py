@@ -3,7 +3,7 @@
 
 Single source of truth: edit a prompt or a Code-node script, then run
     python scripts/build_workflows.py
-and re-import workflows/*.json into n8n (Windows: start.ps1 -Reimport).
+and re-import workflows/*.json into n8n.
 """
 import json
 import uuid
@@ -19,6 +19,7 @@ CRED = {
     "telegramApi": {"id": "schedTelegram0001", "name": "Telegram Bot"},
     "openAiApi": {"id": "schedOpenAi000001", "name": "OpenAI"},
     "googleCalendarOAuth2Api": {"id": "schedGoogleCal001", "name": "Google Calendar OAuth2"},
+    "postgres": {"id": "schedPostgres0001", "name": "Audit Postgres"},
 }
 
 
@@ -61,11 +62,6 @@ def llm(name, pos):
         "jsonBody": "={{ JSON.stringify($json.request) }}",
         "options": {"timeout": 30000},
     }, ["openAiApi"], retryOnFail=True, maxTries=4, waitBetweenTries=5000)
-
-
-def tg(name, pos, params, **extra):
-    return node(name, "n8n-nodes-base.telegram", 1.2, pos, params, ["telegramApi"],
-                retryOnFail=True, maxTries=3, waitBetweenTries=3000, onError="continueRegularOutput", **extra)
 
 
 def calendar(name, pos, method, url_expr, body_expr=None, query=None):
@@ -122,8 +118,8 @@ def build_pipeline():
     y = 300
     nodes = [
         sticky("Note: Ingestion", (-60, 100), (420, 380),
-               "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API "
-               "(public URL via the Cloudflare tunnel).\n\n"
+               "## Ingestion\nPersistent HTTPS webhook registered with the Telegram Bot API. "
+               "In queue mode the execution is pushed to Redis/BullMQ and picked up by a worker.\n\n"
                "**Edit `CONFIG` in _Prepare Input_** (timezone, calendar, retries)."),
         sticky("Note: Stage 1", (400, 100), (640, 380),
                "## Stage 1 · Context filtering & temporal normalisation\nBinary scheduling-intent detection; "
@@ -134,57 +130,15 @@ def build_pipeline():
         sticky("Note: Stage 3", (1760, 100), (900, 560),
                "## Stage 3 · API command synthesis & validation\nJSON for the Calendar Events API v3, schema-validated; "
                "validation errors are fed back to the model for an automatic prompt-adjusted retry.", 6),
-        sticky("Note: Calendar", (2700, -120), (1900, 780),
-               "## Google Calendar API\nBefore POST (create) and PATCH (modify) the requested slot is checked against "
-               "existing events: an overlap stops the operation and the user gets a warning with the next free slot. "
+        sticky("Note: Calendar", (2700, -120), (1120, 780),
+               "## Google Calendar API\nPOST (create) · PATCH (modify) · DELETE (cancel). "
                "Each call retries 4 × 5 s on transient failures.", 3),
-        sticky("Note: Output", (4640, 100), (900, 560),
-               "## Confirmation\nTelegram reply to the chat (or to the owner for Telegram Business messages).\n\n"
-               "**Ask before adding**: when `confirmBefore` applies, the event is parked in the workflow's static data and the owner "
-               "gets a card with ✅ / ❌. The button press comes back through the trigger as a callback_query "
-               "(*Callback?* branch, bottom-left), the saved context is restored and the calendar nodes run."),
+        sticky("Note: Output", (3860, 100), (900, 560),
+               "## Confirmation & audit trail\nTelegram reply + one row in `scheduling_audit` (PostgreSQL)."),
 
-        # explicit update list: n8n registers the webhook (with its secret token) for exactly these;
-        # business_message = Telegram Business chats, callback_query = the ✅/❌ buttons
         node("Telegram Trigger", "n8n-nodes-base.telegramTrigger", 1.1, (0, y),
-             {"updates": ["message", "business_message", "callback_query"], "additionalFields": {}},
-             ["telegramApi"], webhookId=nid("telegram-webhook")),
+             {"updates": ["message"], "additionalFields": {}}, ["telegramApi"], webhookId=nid("telegram-webhook")),
         code("Prepare Input", (220, y), js("prepare_input.js", STAGE1_PROMPT=prompt("stage1_filter.txt"))),
-        if_true("Callback?", (400, y + 500), "={{ $json.kind === 'callback' }}"),
-
-        # ── confirmation flow ("Ask before adding") ──
-        if_true("Confirm Needed?", (4200, y - 400),
-                "={{ !!$json.meta.reply_chat_id && ($json.config.confirmBefore === 'all' || "
-                "($json.config.confirmBefore === 'business' && $json.meta.business)) }}"),
-        code("Prepare Confirmation", (4400, y - 520), js("prepare_confirmation.js")),
-        code("Save Pending", (4600, y - 520), js("save_pending.js")),
-        tg("Ask Owner", (4800, y - 520), {
-            "resource": "message", "operation": "sendMessage",
-            "chatId": "={{ $('Prepare Confirmation').first().json.meta.reply_chat_id }}",
-            "text": "={{ $('Prepare Confirmation').first().json.ask_text }}",
-            "replyMarkup": "inlineKeyboard",
-            "inlineKeyboard": {"rows": [{"row": {"buttons": [
-                {"text": "✅ Add", "additionalFields": {"callback_data": "=ok:{{ $json.id }}"}},
-                {"text": "❌ Skip", "additionalFields": {"callback_data": "=no:{{ $json.id }}"}}]}}]},
-            "additionalFields": {"appendAttribution": False},
-        }),
-        # ── button pressed ──
-        code("Load Pending", (600, y + 500), js("load_pending.js")),
-        code("Restore Pending", (800, y + 500), js("restore_pending.js")),
-        tg("Answer Callback", (1000, y + 500), {
-            "resource": "callback", "operation": "answerQuery",
-            "queryId": "={{ $json.callback.id }}",
-            "additionalFields": {"text": "={{ $json.answer_text }}"},
-        }),
-        tg("Edit Card", (1200, y + 500), {
-            "resource": "message", "operation": "editMessageText", "messageType": "message",
-            "chatId": "={{ $('Restore Pending').first().json.callback.chat_id }}",
-            "messageId": "={{ $('Restore Pending').first().json.callback.message_id }}",
-            "text": "={{ $('Restore Pending').first().json.edit_text }}",
-            "additionalFields": {},
-        }),
-        code("Resume", (1400, y + 500), js("resume.js")),
-        if_true("Approved?", (1600, y + 500), "={{ $json.approved === true }}"),
 
         llm("Stage 1 LLM", (460, y)),
         code("Parse Stage 1", (680, y), js("parse_stage1.js", STAGE2_PROMPT=prompt("stage2_extract.txt"))),
@@ -201,16 +155,7 @@ def build_pipeline():
         if_true("Retry?", (2480, y + 220), "={{ $json.stage3.can_retry }}"),
 
         if_true("Create?", (2760, y), "={{ $json.stage3.command.method === 'POST' }}"),
-        # conflict check: events from the requested start until the end of that day
-        calendar("Find Conflicts", (3600, y - 200), "GET", EVENTS_URL, None, {
-            "timeMin": "={{ DateTime.fromISO($json.stage3.command.body.start ? $json.stage3.command.body.start.dateTime : $now.toISO(), { zone: $json.config.timezone }).toUTC().toISO() }}",
-            "timeMax": "={{ DateTime.fromISO($json.stage3.command.body.start ? $json.stage3.command.body.start.dateTime : $now.toISO(), { zone: $json.config.timezone }).endOf('day').toUTC().toISO() }}",
-            "timeZone": "={{ $json.config.timezone }}",
-            "singleEvents": "true", "orderBy": "startTime", "maxResults": "100"}),
-        code("Detect Conflict", (3800, y - 200), js("detect_conflict.js")),
-        if_true("Slot Free?", (4000, y - 200), "={{ !$json.slot.conflict }}"),
-        if_true("Create Op?", (4200, y - 200), "={{ $json.stage3.command.method === 'POST' }}"),
-        calendar("Create Event", (4400, y - 300), "POST", EVENTS_URL,
+        calendar("Create Event", (3400, y - 240), "POST", EVENTS_URL,
                  "={{ JSON.stringify($json.stage3.command.body) }}", {"sendUpdates": "none"}),
         calendar("Find Events", (2980, y + 100), "GET", EVENTS_URL, None, {
             "timeMin": "={{ $now.minus({ days: 1 }).toUTC().toISO() }}",
@@ -221,46 +166,47 @@ def build_pipeline():
         if_true("Found?", (3380, y + 100), "={{ $json.lookup.found }}"),
         if_true("Cancel?", (3580, y), "={{ $json.stage3.command.method === 'DELETE' }}"),
         calendar("Delete Event", (3800, y - 100), "DELETE", EVENT_URL, None, {"sendUpdates": "none"}),
-        calendar("Patch Event", (4400, y - 100), "PATCH", EVENT_URL,
+        calendar("Patch Event", (3800, y + 80), "PATCH", EVENT_URL,
                  "={{ JSON.stringify($json.stage3.command.body) }}", {"sendUpdates": "none"}),
 
-        code("Finalize", (4700, y), js("finalize.js")),
-        if_true("Has Reply?", (4900, y), "={{ $json.has_reply }}"),
-        node("Send Confirmation", "n8n-nodes-base.telegram", 1.2, (5100, y - 80), {
+        code("Finalize", (3920, y), js("finalize.js")),
+        if_true("Has Reply?", (4120, y), "={{ $json.has_reply }}"),
+        node("Send Confirmation", "n8n-nodes-base.telegram", 1.2, (4320, y - 80), {
             "resource": "message", "operation": "sendMessage",
-            "chatId": "={{ $json.reply_chat_id }}", "text": "={{ $json.reply }}",
-            "additionalFields": {"appendAttribution": False},
+            "chatId": "={{ $json.chat_id }}", "text": "={{ $json.reply }}",
+            "additionalFields": {"appendAttribution": False,
+                                 "reply_to_message_id": "={{ Number($json.message_id) }}"},
         }, ["telegramApi"], retryOnFail=True, maxTries=3, waitBetweenTries=3000, onError="continueRegularOutput"),
+        node("Audit Log", "n8n-nodes-base.postgres", 2.5, (4540, y), {
+            "operation": "executeQuery",
+            "query": "INSERT INTO scheduling_audit (chat_id, message_id, status, intent, latency_ms, stage3_attempts, payload)\n"
+                     "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb);",
+            "options": {"queryReplacement":
+                        "={{ [ $('Finalize').first().json.chat_id, $('Finalize').first().json.message_id, "
+                        "$('Finalize').first().json.status, $('Finalize').first().json.intent, "
+                        "$('Finalize').first().json.latency_ms, $('Finalize').first().json.stage3_attempts, "
+                        "JSON.stringify($('Finalize').first().json.payload) ] }}"},
+        }, ["postgres"], onError="continueRegularOutput"),
     ]
     c = {}
-    for a, b in [("Telegram Trigger", "Prepare Input"), ("Prepare Input", "Callback?"), ("Prepare Confirmation", "Save Pending"),
-                 ("Save Pending", "Ask Owner"), ("Ask Owner", "Finalize"),
-                 ("Load Pending", "Restore Pending"), ("Restore Pending", "Answer Callback"),
-                 ("Answer Callback", "Edit Card"), ("Edit Card", "Resume"), ("Resume", "Approved?"),
+    for a, b in [("Telegram Trigger", "Prepare Input"), ("Prepare Input", "Stage 1 LLM"),
                  ("Stage 1 LLM", "Parse Stage 1"), ("Parse Stage 1", "Scheduling?"),
                  ("Stage 2 LLM", "Parse Stage 2"), ("Parse Stage 2", "Entities OK?"),
                  ("Build Stage 3 Request", "Stage 3 LLM"), ("Stage 3 LLM", "Validate Command"),
                  ("Validate Command", "Valid?"), ("Find Events", "Pick Event"), ("Pick Event", "Found?"),
-                 ("Find Conflicts", "Detect Conflict"), ("Detect Conflict", "Slot Free?"),
                  ("Create Event", "Finalize"), ("Delete Event", "Finalize"), ("Patch Event", "Finalize"),
-                 ("Finalize", "Has Reply?")]:
+                 ("Finalize", "Has Reply?"), ("Send Confirmation", "Audit Log")]:
         connect(c, a, b)
-    for src, yes, no in [("Callback?", "Load Pending", "Stage 1 LLM"),
-                         ("Confirm Needed?", "Prepare Confirmation", "Create Op?"),
-                         ("Approved?", "Create Op?", "Finalize"),
-                         ("Scheduling?", "Stage 2 LLM", "Finalize"),
+    for src, yes, no in [("Scheduling?", "Stage 2 LLM", "Finalize"),
                          ("Entities OK?", "Build Stage 3 Request", "Finalize"),
                          ("Valid?", "Create?", "Retry?"),
                          ("Retry?", "Build Stage 3 Request", "Finalize"),
-                         ("Create?", "Find Conflicts", "Find Events"),
+                         ("Create?", "Create Event", "Find Events"),
                          ("Found?", "Cancel?", "Finalize"),
-                         ("Cancel?", "Delete Event", "Find Conflicts"),
-                         ("Slot Free?", "Confirm Needed?", "Finalize"),
-                         ("Create Op?", "Create Event", "Patch Event"),
-                         ]:
+                         ("Cancel?", "Delete Event", "Patch Event"),
+                         ("Has Reply?", "Send Confirmation", "Audit Log")]:
         connect(c, src, yes, 0)
         connect(c, src, no, 1)
-    connect(c, "Has Reply?", "Send Confirmation", 0)
     return workflow("Smart Scheduling - Three-Stage LLM Pipeline", nodes, c)
 
 
@@ -268,7 +214,7 @@ def build_baseline():
     y = 300
     nodes = [
         sticky("Note: Baseline", (-60, 60), (1500, 440),
-               "## Single-model baseline\nOne GPT-4o-mini call does filtering, extraction and command "
+               "## Single-model baseline (paper, Table V)\nOne GPT-4o-mini call does filtering, extraction and command "
                "synthesis at once. For comparison only - it handles `create` and has no retry. "
                "Keep it **inactive** while the three-stage pipeline is active: a Telegram bot can only have one webhook."),
         node("Telegram Trigger", "n8n-nodes-base.telegramTrigger", 1.1, (0, y),

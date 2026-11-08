@@ -4,7 +4,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Single-model baseline\nOne GPT-4o-mini call does filtering, extraction and command synthesis at once. For comparison only - it handles `create` and has no retry. Keep it **inactive** while the three-stage pipeline is active: a Telegram bot can only have one webhook.",
+        "content": "## Single-model baseline (paper, Table V)\nOne GPT-4o-mini call does filtering, extraction and command synthesis at once. For comparison only - it handles `create` and has no retry. Keep it **inactive** while the three-stage pipeline is active: a Telegram bot can only have one webhook.",
         "width": 1500,
         "height": 440
       },

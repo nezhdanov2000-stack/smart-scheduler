@@ -7,16 +7,10 @@ const input = $input.first().json;
 
 let ctx, status, result = null;
 if (ran('Create Event') || ran('Patch Event') || ran('Delete Event')) {
-  ctx = ran('Restore Pending') ? last('Restore Pending') : ran('Pick Event') ? last('Pick Event') : last('Validate Command');
+  ctx = ran('Pick Event') ? last('Pick Event') : last('Validate Command');
   result = input;
   if (input.error) status = 'calendar_error';
   else status = ran('Create Event') ? 'created' : ran('Patch Event') ? 'modified' : 'cancelled';
-} else if (ran('Ask Owner')) {
-  ctx = last('Prepare Confirmation'); status = 'pending';          // waiting for ✅ / ❌
-} else if (ran('Restore Pending')) {
-  ctx = last('Restore Pending'); status = ctx.expired ? 'expired' : 'skipped';
-} else if (ran('Detect Conflict')) {
-  ctx = last('Detect Conflict'); status = ctx.slot.error ? 'calendar_error' : 'conflict';
 } else if (ran('Pick Event')) {
   ctx = last('Pick Event'); status = 'event_not_found';
 } else if (ran('Validate Command')) {
@@ -44,15 +38,6 @@ switch (status) {
   case 'cancelled':
     reply = `🗑️ Cancelled: ${ctx.lookup.event_summary}`;
     break;
-  case 'conflict': {
-    const c = ctx.slot.conflicts[0];
-    const verb = ctx.stage2.intent === 'modify' ? 'Not moved' : 'Not added';
-    reply = `⚠️ ${verb} — that slot is already taken by "${c.summary}" (${c.start}–${c.end})` +
-            (ctx.slot.conflicts.length > 1 ? ` and ${ctx.slot.conflicts.length - 1} more` : '') + '.' +
-            (ctx.slot.suggestion ? `\n💡 Next free slot that day: ${ctx.slot.suggestion.label}.` : '') +
-            `\nSend a different time and I'll schedule "${ent.event_title}".`;
-    break;
-  }
   case 'event_not_found':
     reply = `⚠️ I couldn't find a calendar event matching "${ctx.stage3.command.target?.summary}". Nothing was changed.`;
     break;
@@ -60,22 +45,15 @@ switch (status) {
   case 'calendar_error':
     reply = `⚠️ I understood this as a scheduling request ("${ent.event_title || '?'}") but couldn't write it to the calendar. Please add it manually.`;
     break;
-  // 'discarded', 'entity_failed', 'pending', 'skipped', 'expired' stay silent (the card already says it)
+  // 'discarded' and 'entity_failed' stay silent so the bot never spams the group
 }
-if (!ctx.config.sendConfirmation || !ctx.meta.reply_chat_id) reply = null;
-if (ctx.kind === 'callback' && status !== 'created' && status !== 'modified' && status !== 'calendar_error') reply = null;
-if (reply && ctx.meta.business) {
-  const quote = ctx.text.length > 120 ? ctx.text.slice(0, 117) + '…' : ctx.text;
-  reply = `💬 ${ctx.meta.sender} in chat with ${ctx.meta.counterpart}: "${quote}"\n\n` + reply;
-}
+if (!ctx.config.sendConfirmation) reply = null;
 
 const payload = {
   stage1: ctx.stage1 || null,
   stage2: ctx.stage2 || null,
   stage3: ctx.stage3 ? { attempt: ctx.stage3.attempt, valid: ctx.stage3.valid, errors: ctx.stage3.errors, command: ctx.stage3.command } : null,
   lookup: ctx.lookup || null,
-  slot: ctx.slot || null,
-  pending_id: ctx.pending_id || null,
   calendar_event_id: result?.id || ctx.lookup?.event_id || null,
   calendar_error: result?.error ? (result.error.message || String(result.error)) : null,
 };
@@ -86,8 +64,6 @@ return [{
   json: {
     chat_id: String(ctx.meta.chat_id),
     message_id: String(ctx.meta.message_id),
-    reply_chat_id: ctx.meta.reply_chat_id ? String(ctx.meta.reply_chat_id) : null,
-    reply_to: ctx.meta.reply_to || null,
     status,
     intent: ctx.stage2?.intent || null,
     latency_ms: Date.now() - ctx.meta.received_at_ms,
